@@ -800,7 +800,7 @@ perform_tlscert (const char *rhost,
 }
 
 static pam_handle_t *
-perform_external (
+perform_session_user_command (
                  const char *command,
                  const char *rhost,
                  const char *type,
@@ -821,10 +821,37 @@ perform_external (
 
   debug ("start external authentication (%s) for cockpit-ws %u", type, getppid ());
 
-  /* Run the external command. If it fails, set username to NULL */
-  char *username = run_user_command(command, rhost, authorization);
-  if (username == NULL)
-    errx (EX, "no user provided by external command: %s", command);
+
+  /* Create a memfd to capture */
+  int memfd = memfd_create("username-output", MFD_CLOEXEC);
+  if (memfd < 0)
+    err (EX, "memfd_create failed");
+  const char *command_argv[] = { command, NULL };
+
+  const int remap_fds[] = { -1, memfd, -1 }; // only remap stdout to memfd
+  int status = spawn_and_wait(command_argv, NULL, remap_fds, 3, getuid(), getgid());
+
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    close(memfd);
+    errx(EX, "external command failed: %s", command);
+  }
+
+  char username[1025];
+  /* Reset file offset to start */
+  lseek(memfd, 0, SEEK_SET);
+
+  /* Read the output, max of 1024 bytes */
+  ssize_t nread = read(memfd, username, 1024);
+  close(memfd);
+
+  if (nread < 0)
+    err(EX, "read from external memfd failed");
+
+  username[nread] = '\0';
+  username[strcspn(username, "\n")] = '\0'; /* null-terminate at first newline */
+
+  if (username[0] == '\0')
+    errx(EX, "no username provided by external command: %s", command);
 
   res = pam_start ("cockpit", username, &conv, &pamh);
   if (res != PAM_SUCCESS)
@@ -834,10 +861,6 @@ perform_external (
     errx (EX, "couldn't setup pam rhost");
 
   res = open_session (pamh);
-
-  create_s4u_ticket (username);
-
-  free (username);
 
   /* Our exit code is a PAM code */
   if (res != PAM_SUCCESS)
@@ -1043,7 +1066,7 @@ main (int argc,
   else {
     const char *command = cockpit_conf_string (type, "SessionUserCommand");
     if (command != NULL) {
-      pamh = perform_external (command, rhost, type, response);
+      pamh = perform_session_user_command (command, rhost, type, response);
     }
   }
 
